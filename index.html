@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#00ff00">
+
+<script>
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("sw.js")
+    .then(() => console.log("Yati OS Service Worker registered"));
+}
+</script>
+<style>
+  :root{
+    --bg:#000; --fg:#00ff66; --accent:#00ff66; --muted:rgba(0,255,102,0.12);
+  }
+  html,body{height:100%;}
+  body{
+    margin:0; padding:0; height:100%; background:var(--bg); color:var(--fg);
+    font-family:monospace; display:flex; flex-direction:column; overflow:hidden;
+  }
+  /* Terminal container */
+  #container{display:flex; flex-direction:column; height:100%; padding:12px; box-sizing:border-box}
+  #terminal{
+    flex:1; overflow:auto; white-space:pre-wrap; padding:12px; border:2px solid var(--accent);
+    box-shadow:0 0 18px rgba(0,255,102,0.06); margin-bottom:8px; position:relative;
+    background:linear-gradient(180deg, rgba(0,0,0,0.0), rgba(0,0,0,0.02));
+  }
+  /* CRT faint scanlines */
+  #terminal::before{ content:""; position:absolute; left:0;top:0;right:0;bottom:0;
+    background:repeating-linear-gradient(to bottom, rgba(0,255,102,0.02) 0 2px, transparent 2px 4px); pointer-events:none; }
+  #input-line{display:flex; align-items:center}
+  #prompt{margin-right:8px}
+  #cmd-input{flex:1; background:none; border:none; color:var(--fg); outline:none; font:inherit; caret-color:transparent}
+  #cursor{width:8px;height:18px;background:var(--fg); display:inline-block; margin-left:6px; animation:blink 1s steps(2) infinite}
+  @keyframes blink{50%{opacity:0}}
+
+  /* App viewer */
+  #app-viewer{position:fixed; inset:40px; display:none; flex-direction:column; border:2px solid var(--accent); background:#001100; z-index:60}
+  #app-header{display:flex; align-items:center; justify-content:space-between; padding:8px 12px; border-bottom:1px solid var(--accent)}
+  #app-title{font-weight:700}
+  .app-actions{display:flex; gap:8px}
+  .btn{background:none;border:1px solid var(--accent); color:var(--fg); padding:4px 8px; cursor:pointer; font-family:monospace}
+  #app-frame{flex:1; border:none; width:100%; height:100%; background:white}
+
+  /* small helpers */
+  .muted{color:rgba(0,255,102,0.5)}
+  pre{margin:0;}
+
+  /* responsive smaller screens */
+  @media (max-width:640px){ #app-viewer{inset:8px} }
+</style>
+</head>
+<body>
+  <div id="container">
+    <div id="terminal" tabindex="0"></div>
+
+    <div id="input-line">
+      <span id="prompt">C$AOS>></span>
+      <input id="cmd-input" autocomplete="off" spellcheck="false">
+      <span id="cursor"></span>
+    </div>
+  </div>
+
+  <!-- App viewer -->
+  <div id="app-viewer">
+    <div id="app-header">
+      <div>
+        <span id="app-title">App</span><div id="app-overlay" style="
+    position:absolute; 
+    inset:56px 40px 40px 40px;
+    display:flex; 
+    align-items:center; 
+    justify-content:center;
+    pointer-events:none; 
+    font-family:monospace; 
+    font-size:20px;
+    color: rgba(0,255,102,0.12); 
+    z-index:70; 
+    text-align:center;
+    -webkit-text-stroke: 1px rgba(0,255,102,0.06);
+">-
+        <span class="muted" id="app-url" style="margin-left:12px;font-weight:400"></span>
+      </div>
+      <div class="app-actions">
+        <button class="btn" id="open-newtab">Open in new tab</button>
+        <button class="btn" id="reload-app">Reload</button>
+        <button class="btn" id="exit-app">Exit App</button>
+      </div>
+    </div>
+    <iframe id="app-frame" sandbox="allow-same-origin allow-scripts allow-forms allow-popups"></iframe>
+  </div>
+
+<script>
+// === A.O.S Simulator — single-file app ===
+// Local DB keys
+const KEY_APPS = 'aos_apps_v1';
+const KEY_FILES = 'aos_files_v1';
+const KEY_NOTES = 'aos_notes_v1';
+const KEY_HISTORY = 'aos_history_v1';
+const KEY_PREFS = 'aos_prefs_v1';
+
+// Elements
+const terminal = document.getElementById('terminal');
+const input = document.getElementById('cmd-input');
+const cursor = document.getElementById('cursor');
+const promptEl = document.getElementById('prompt');
+
+const appViewer = document.getElementById('app-viewer');
+const appFrame = document.getElementById('app-frame');
+const appTitle = document.getElementById('app-title');
+const appUrlLabel = document.getElementById('app-url');
+const openNewTabBtn = document.getElementById('open-newtab');
+const reloadAppBtn = document.getElementById('reload-app');
+const exitAppBtn = document.getElementById('exit-app');
+
+// State
+let apps = JSON.parse(localStorage.getItem(KEY_APPS) || '{}');
+let files = JSON.parse(localStorage.getItem(KEY_FILES) || '{}');
+let notes = JSON.parse(localStorage.getItem(KEY_NOTES) || '[]');
+let history = JSON.parse(localStorage.getItem(KEY_HISTORY) || '[]');
+let prefs = JSON.parse(localStorage.getItem(KEY_PREFS) || JSON.stringify({theme:'dark',fontsize:16}));
+
+let historyIndex = history.length;
+let shutdownMode = false;
+let currentApp = null;
+
+// Utility helpers
+function saveAll(){ localStorage.setItem(KEY_APPS, JSON.stringify(apps)); localStorage.setItem(KEY_FILES, JSON.stringify(files)); localStorage.setItem(KEY_NOTES, JSON.stringify(notes)); localStorage.setItem(KEY_HISTORY, JSON.stringify(history)); localStorage.setItem(KEY_PREFS, JSON.stringify(prefs)); }
+function now(){ return new Date(); }
+function writeLine(text=''){ terminal.innerHTML += text + '\n'; terminal.scrollTop = terminal.scrollHeight; }
+function clearTerminal(){ terminal.innerHTML = ''; }
+function sanitizeName(name){ return (name||'').toString().trim(); }
+function lowerKey(k){ return k.toLowerCase(); }
+
+// Boot animation
+function boot(){
+  clearTerminal();
+  const d = now();
+  const header = `       Welcome-to-A_O_S\n================================\nDATE: ${d.toLocaleDateString()}\nTIME: ${d.toLocaleTimeString()}\n\nAOS_$_cammand#window#start___\n__________________________\n\n`;
+  typeText(header, 12, () => {
+    writeLine("Type 'help' for commands.\n");
+  });
+}
+
+function typeText(text, speed=20, cb){
+  let i=0; const t = setInterval(()=>{
+    terminal.innerHTML += text.charAt(i);
+    terminal.scrollTop = terminal.scrollHeight;
+    i++; if(i>=text.length){ clearInterval(t); if(cb)cb(); }
+  }, speed);
+}
+
+// Command implementations
+const CMDS = {
+  help(){
+    writeLine(`Available commands:\n`+
+`help                 - show this help\n`+
+`cls                  - clear terminal\n`+
+`time                 - show current time\n`+
+`date                 - show current date\n`+
+`sys_info             - system info\n`+
+`apps                 - list installed web apps\n`+
+`install_app>>name>>url - install web app\n`+
+`open_app>>name       - open installed app (in viewer)\n`+
+`del_app>>name        - remove installed app\n`+
+`files                - list fake files\n`+
+`mkfile filename content - create file\n`+
+`read filename        - read file content\n`+
+`del filename         - delete file\n`+
+`note>>text           - save a quick note\n`+
+`notes                - list notes\n`+
+`del_note>>id         - delete note by id (index)\n`+
+`theme>>dark|light    - set theme\n`+
+`shutdown             - end session (disable input)\n`);
+  },
+  cls(){ clearTerminal(); },
+  time(){ writeLine(now().toLocaleTimeString()); },
+  date(){ writeLine(now().toLocaleDateString()); },
+  sys_info(){
+    writeLine(`System Info:\nUserAgent: ${navigator.userAgent}\nPlatform: ${navigator.platform}\nLanguage: ${navigator.language}\nLocal Time: ${now().toString()}`);
+  },
+  apps(){
+    const keys = Object.keys(apps);
+    if(!keys.length) writeLine('No apps installed. Use install_app>>name>>url');
+    else writeLine(keys.map(k=>`- ${k} -> ${apps[k]}`).join('\n'));
+  },
+  install_app(cmd){
+    // format: install_app>>name>>url  OR name>>url>>app_load
+    const parts = cmd.split('>>');
+    if(parts.length>=3){
+      const name = sanitizeName(parts[1]);
+      const url = parts[2].trim();
+      if(!name || !url){ writeLine('Usage: install_app>>name>>url'); return; }
+      apps[lowerKey(name)] = url;
+      saveAll();
+      writeLine(`App '${name}' installed.`);
+    } else {
+      writeLine('Usage: install_app>>name>>url');
+    }
+  },
+  open_app(cmd){
+    const parts = cmd.split('>>');
+    const name = sanitizeName(parts[1]||parts[0].split('>>')[1] || '');
+    if(!name){ writeLine('Usage: open_app>>name'); return; }
+    const key = lowerKey(name);
+    const url = apps[key];
+    if(!url){ writeLine(`App '${name}' not found.`); return; }
+    openAppInternal(name, url);
+  },
+  del_app(cmd){
+    const parts = cmd.split('>>'); const name = sanitizeName(parts[1]);
+    if(!name){ writeLine('Usage: del_app>>name'); return; }
+    const key = lowerKey(name);
+    if(apps[key]){ delete apps[key]; saveAll(); writeLine(`App '${name}' removed.`); }
+    else writeLine(`App '${name}' not found.`);
+  },
+  files(){ const ks = Object.keys(files); writeLine(ks.length?ks.map(k=>`- ${k}`).join('\n'):'No files.'); },
+  mkfile(cmd){ const parts = cmd.split(' '); const name = parts[1]; const content = parts.slice(2).join(' ');
+    if(!name){ writeLine('Usage: mkfile filename content'); return; }
+    files[name] = content || '';
+    saveAll(); writeLine(`File '${name}' created.`);
+  },
+  read(cmd){ const parts = cmd.split(' '); const name = parts[1]; if(!name){ writeLine('Usage: read filename'); return; }
+    if(files[name]!==undefined) writeLine(files[name]); else writeLine(`File '${name}' not found.`);
+  },
+  del(cmd){ const parts = cmd.split(' '); const name = parts[1]; if(!name){ writeLine('Usage: del filename'); return; }
+    if(files[name]!==undefined){ delete files[name]; saveAll(); writeLine(`File '${name}' deleted.`); } else writeLine(`File '${name}' not found.`);
+  },
+  note(cmd){ const parts = cmd.split('>>'); const text = (parts[1]||'').trim(); if(!text){ writeLine('Usage: note>>your note text'); return; }
+    notes.push({id:Date.now(),text}); saveAll(); writeLine('Note saved.'); },
+  notes(){ if(!notes.length) writeLine('No notes.'); else writeLine(notes.map((n,i)=>`${i}: ${n.text}`).join('\n')); },
+  del_note(cmd){ const parts = cmd.split('>>'); const id = parts[1]; const idx = Number(id);
+    if(Number.isInteger(idx) && notes[idx]){ notes.splice(idx,1); saveAll(); writeLine('Note deleted.'); } else writeLine('Usage: del_note>>index (see notes)'); },
+  theme(cmd){ const parts = cmd.split('>>'); const t = (parts[1]||'').trim(); if(t==='light'){ document.documentElement.style.setProperty('--bg','#f7f7f7'); document.documentElement.style.setProperty('--fg','#006400'); prefs.theme='light'; saveAll(); writeLine('Theme set to light.'); }
+    else { document.documentElement.style.setProperty('--bg','#000'); document.documentElement.style.setProperty('--fg','#00ff66'); prefs.theme='dark'; saveAll(); writeLine('Theme set to dark.'); } },
+  shutdown(){ writeLine('Shutting down A.O.S...'); input.disabled=true; shutdownMode=true; }
+};
+
+// Open app in viewer with UI fallback
+function openAppInternal(name, url){
+  currentApp = {name, url};
+  appTitle.textContent = name;
+  appUrlLabel.textContent = url;
+  appViewer.style.display = 'flex';
+  // set iframe src
+  try{
+    appFrame.src = url;
+  }catch(e){
+    // some browsers may error on assignment; fallback
+    appFrame.src = 'about:blank';
+  }
+  // provide a message in terminal with quick fallback
+  writeLine(`Launching '${name}' — if the site blocks embedding, click 'Open in new tab'.`);
+}
+
+// App viewer controls
+openNewTabBtn.addEventListener('click', ()=>{ if(currentApp) window.open(currentApp.url, '_blank'); });
+reloadAppBtn.addEventListener('click', ()=>{ if(currentApp) appFrame.src = currentApp.url; });
+exitAppBtn.addEventListener('click', ()=>{ appViewer.style.display='none'; appFrame.src=''; currentApp=null; input.focus(); });
+
+// Command parsing & execution
+function handleCommand(raw){
+  if(shutdownMode){ writeLine('System is shut down. Reload to restart.'); return; }
+  const cmd = raw.trim(); if(!cmd){ writeLine(''); return; }
+  // save history
+  history.push(cmd); localStorage.setItem(KEY_HISTORY, JSON.stringify(history)); historyIndex = history.length;
+  // flexible syntax: allow both patterns name>>url>>app_load or install_app>>name>>url
+  if(cmd.toLowerCase().includes('>>app_load') || /install_app>>/i.test(cmd)){
+    // support both "Name>>URL>>app_load" and "install_app>>name>>url"
+    if(cmd.toLowerCase().includes('>>app_load')){
+      const parts = cmd.split('>>');
+      const name = sanitizeName(parts[0]);
+      const url = parts[1] || parts[1] === '' ? parts[1] : '';
+      if(!name || !url){ writeLine('Usage: Name>>URL>>app_load'); return; }
+      apps[lowerKey(name)] = url.trim(); saveAll(); writeLine(`Web app '${name}' saved.`); return;
+    } else {
+      CMDS.install_app(cmd); return;
+    }
+  }
+
+  // flexible open: accept open_app, open__app, Open__App etc.
+  const openMatch = cmd.match(/^open[_\s]*app>>(.+)$/i);
+  if(openMatch){ const name = sanitizeName(openMatch[1]); CMDS.open_app('open_app>>'+name); return; }
+
+  // del_app
+  const delAppMatch = cmd.match(/^del[_\s]*app>>(.+)$/i);
+  if(delAppMatch){ CMDS.del_app('del_app>>'+sanitizeName(delAppMatch[1])); return; }
+
+  // note pattern note>>text
+  if(/^note>>/i.test(cmd)){ CMDS.note(cmd); return; }
+  if(/^del_note>>/i.test(cmd)){ CMDS.del_note(cmd); return; }
+
+  // other direct commands
+  const main = cmd.split(' ')[0].toLowerCase();
+  if(CMDSimpleHas(main)){
+    // handle simple commands that take no args
+    if(['help','cls','time','date','sys_info','apps','files','notes','shutdown'].includes(main)){
+      CMDS[main](); return;
+    }
+    if(main==='theme'){ CMDS.theme(cmd); return; }
+  }
+
+  // file commands mkfile/read/del (space separated)
+  if(/^mkfile /i.test(cmd)){ CMDS.mkfile(cmd); return; }
+  if(/^read /i.test(cmd)){ CMDS.read(cmd); return; }
+  if(/^del /i.test(cmd)){ CMDS.del(cmd); return; }
+
+  // install_app shorthand
+  if(/^install_app>>/i.test(cmd)){ CMDS.install_app(cmd); return; }
+
+  // notes index
+  if(/^notes$/i.test(cmd)){ CMDS.notes(); return; }
+
+  // apps list
+  if(/^apps$/i.test(cmd)){ CMDS.apps(); return; }
+
+  // fallback
+  writeLine(`'${cmd}' is not recognized in A.O.S.`);
+}
+function CMDSimpleHas(k){ return Object.prototype.hasOwnProperty.call(CMDSimple(), k); }
+function CMDSimple(){ return {help:1,cls:1,time:1,date:1,sys_info:1,apps:1,files:1,notes:1,shutdown:1}; }
+
+// Input handling & history navigation
+input.addEventListener('keydown', (e)=>{
+  if(e.key==='Enter'){
+    const value = input.value;
+    writeLine(`C$AOS>> ${value}`);
+    handleCommand(value);
+    input.value='';
+  } else if(e.key==='ArrowUp'){
+    if(historyIndex>0) historyIndex--; input.value = history[historyIndex]||''; e.preventDefault();
+  } else if(e.key==='ArrowDown'){
+    if(historyIndex < history.length-1) historyIndex++; input.value = history[historyIndex]||''; e.preventDefault();
+  }
+});
+
+// click terminal to focus input
+terminal.addEventListener('click', ()=>input.focus());
+
+// initial boot
+boot();
+
+// expose some helpers to console for debugging (optional)
+window.AOS = {apps,files,notes,history,prefs,saveAll};
+
+</script>
+</body>
+</html>
